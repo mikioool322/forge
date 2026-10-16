@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.db
+*.db-wal
+*.db-shm
+/.forge
+/docs/PROGRESS.tmp

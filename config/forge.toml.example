@@ -1,0 +1,58 @@
+# Example Forge configuration exercising every adapter kind.
+#
+# Copy the relevant sections into ~/.config/forge/config.toml (or
+# %APPDATA%\forge\config.toml) and adjust commands/capabilities.
+#
+# Notes:
+# * `command = "@self"` resolves to the running forge binary.
+# * Real adapters only pass flags that the installed CLI advertises in its
+#   own `--help` output; nothing is invented here.
+# * Authentication always uses the CLI's own official session/token store.
+#   Forge never reads or extracts credentials.
+
+[daemon]
+max_concurrency = 2
+task_timeout_secs = 900
+heartbeat_interval_secs = 5
+lease_timeout_secs = 120
+connection_limit = 32
+shutdown_drain_secs = 0
+
+[git]
+branch_prefix = "forge/"
+keep_failed_worktrees = true
+
+[logs]
+max_file_bytes = 67108864
+max_line_bytes = 16384
+tail_default_lines = 200
+
+[recovery]
+orphan_action = "kill"
+
+# --- deterministic controlled process (infrastructure tests) --------------
+
+[[agents]]
+id = "sim-a"
+kind = "generic"
+command = "@self"
+extra_args = ["__demo-agent", "--name", "sim-a", "--file", "alpha.txt"]
+capabilities = ["code"]
+
+# --- Codex CLI (enable when installed and authorized) ----------------------
+
+# [[agents]]
+# id = "codex-a"
+# kind = "codex"
+# command = "codex"
+# capabilities = ["code"]
+# slots = 1
+
+# --- OpenCode 2 (enable when installed and authorized) ---------------------
+
+# [[agents]]
+# id = "opencode-b"
+# kind = "opencode"
+# command = "opencode"
+# capabilities = ["code", "tests"]
+# slots = 1

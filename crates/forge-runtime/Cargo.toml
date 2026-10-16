@@ -1,0 +1,20 @@
+[package]
+name = "forge-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Forge agent adapters and subprocess supervision"
+
+[dependencies]
+forge-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

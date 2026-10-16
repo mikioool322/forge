@@ -1,0 +1,18 @@
+[package]
+name = "forge-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Forge SQLite persistence: schema, migrations and repositories"
+
+[dependencies]
+forge-core.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

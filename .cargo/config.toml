@@ -1,0 +1,17 @@
+# Forge repository Cargo configuration.
+#
+# Windows development is supported without Visual Studio using the
+# `stable-x86_64-pc-windows-gnu` toolchain plus a portable LLVM-MinGW
+# installation. Dot-source `scripts\dev-env.ps1` before invoking cargo; it
+# exports CC/AR/RANLIB (absolute paths) for the `cc` crate so that bundled
+# SQLite and `dlltool` (raw-dylib import libraries) resolve correctly.
+#
+# `rust-lld` ships inside the rustup toolchain (self-contained mingw-w64
+# libraries are bundled as well), so no external linker is required. Without
+# this pin, rustc would prefer LLVM-MinGW's `x86_64-w64-mingw32-gcc` driver
+# if it is on PATH, which does not ship libgcc.
+#
+# Nothing in this file is required on macOS/Linux.
+
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"

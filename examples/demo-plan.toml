@@ -1,0 +1,28 @@
+# Deterministic demo plan used by scripts/e2e-demo.ps1.
+#
+# Two independent tasks with disjoint resource claims: both are dispatched
+# concurrently to two agents, each in its own Git worktree.
+
+plan_version = 1
+project = "demo-api"
+
+[[tasks]]
+key = "alpha"
+title = "create alpha module"
+spec = "Create alpha.txt in the repository with the module scaffolding."
+capabilities = ["code"]
+claims = ["file:alpha.txt"]
+
+[[tasks]]
+key = "beta"
+title = "create beta module"
+spec = "Create beta.txt in the repository with the module scaffolding."
+capabilities = ["code"]
+claims = ["file:beta.txt"]
+
+[[tasks]]
+key = "gamma"
+title = "integration report (depends on alpha and beta)"
+spec = "Summarize what alpha and beta produced."
+capabilities = ["code"]
+deps = ["alpha", "beta"]

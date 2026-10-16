@@ -1,0 +1,13 @@
+[package]
+name = "forge-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Forge Git worktree lifecycle and repository operations"
+
+[dependencies]
+forge-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

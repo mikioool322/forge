@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forge",
+    "crates/forge-core",
+    "crates/forge-git",
+    "crates/forge-protocol",
+    "crates/forge-runtime",
+    "crates/forge-store",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+description = "Forge - local-first multi-agent software factory"
+authors = ["Forge contributors"]
+
+[workspace.dependencies]
+forge-core = { path = "crates/forge-core" }
+forge-store = { path = "crates/forge-store" }
+forge-git = { path = "crates/forge-git" }
+forge-runtime = { path = "crates/forge-runtime" }
+forge-protocol = { path = "crates/forge-protocol" }
+
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "net",
+    "io-util",
+    "io-std",
+    "time",
+    "sync",
+    "fs",
+    "signal",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+ratatui = "0.29"
+crossterm = "0.28"
+dirs = "5"
+rand = "0.8"
+libc = "0.2"
+tempfile = "3"
+
+[profile.release]
+strip = true
