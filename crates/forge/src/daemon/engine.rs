@@ -26,8 +26,8 @@ use forge_core::scheduler::{
 use forge_core::{ForgeConfig, ForgePaths};
 use forge_git::GitRepo;
 use forge_protocol::messages::{
-    AttemptView, DaemonInfo, ErrorCode, Notification, Response, StateSnapshot, TaskDetail, TaskView,
-    PROTOCOL_VERSION,
+    AttemptView, DaemonInfo, ErrorCode, Notification, Response, StateSnapshot, TaskDetail,
+    TaskView, PROTOCOL_VERSION,
 };
 use forge_runtime::adapter::{adapter_for, AgentJob, HelpFlags};
 use forge_runtime::platform::{self, ProcessIdentity};
@@ -2037,7 +2037,13 @@ impl Engine {
             let _ = self
                 .store
                 .call(move |conn| {
-                    repo::close_session(conn, session_id, session_state, exit_code, Some(tree_state))
+                    repo::close_session(
+                        conn,
+                        session_id,
+                        session_state,
+                        exit_code,
+                        Some(tree_state),
+                    )
                 })
                 .await;
         }

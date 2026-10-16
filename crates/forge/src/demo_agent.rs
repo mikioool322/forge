@@ -32,6 +32,50 @@ pub fn run(args: &DemoAgentArgs) -> std::process::ExitCode {
         "[{name}] starting; workdir={}",
         std::env::current_dir().unwrap_or_default().display()
     );
+
+    // Optional: read the prompt from stdin before doing anything else. A process
+    // that never reads stdin is the default (the stdin-backpressure tests rely
+    // on it), and `--read-stdin-bytes` selects the reading behaviour.
+    if args.read_stdin_bytes > 0 {
+        use std::io::Read;
+        let mut buf = vec![0u8; args.read_stdin_bytes];
+        let mut read = 0usize;
+        let mut stdin = std::io::stdin();
+        while read < buf.len() {
+            match stdin.read(&mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(_) => break,
+            }
+        }
+        println!("[{name}] read {read} bytes from stdin");
+    }
+
+    // Optional: a helper process that deliberately outlives this one.
+    if args.spawn_descendant_ms > 0 {
+        let seconds = (args.spawn_descendant_ms / 1000).max(1) + 1;
+        let mut cmd = descendant_command(seconds);
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        #[cfg(windows)]
+        if args.breakaway {
+            use std::os::windows::process::CommandExt;
+            // CREATE_BREAKAWAY_FROM_JOB: the helper leaves Forge's Job Object, so
+            // it is outside the tree contract and must be reported, not claimed.
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+            cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+        }
+        match cmd.spawn() {
+            Ok(child) => println!(
+                "[{name}] spawned descendant pid={} breakaway={}",
+                child.id(),
+                args.breakaway
+            ),
+            Err(e) => eprintln!("[{name}] error: cannot spawn descendant: {e}"),
+        }
+    }
+
     let mut json_out = std::io::stdout();
     let _ = writeln!(
         json_out,
@@ -98,6 +142,22 @@ pub fn run(args: &DemoAgentArgs) -> std::process::ExitCode {
 
     println!("[{name}] done");
     std::process::ExitCode::SUCCESS
+}
+
+/// A helper process that stays alive for roughly `seconds` seconds.
+fn descendant_command(seconds: u64) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/C", &format!("ping -n {seconds} 127.0.0.1 > NUL")]);
+        cmd
+    }
+    #[cfg(unix)]
+    {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &format!("sleep {seconds}")]);
+        cmd
+    }
 }
 
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {

@@ -294,9 +294,7 @@ async fn supervise(
     let identity = ProcessIdentity::new(
         pid,
         snapshot.as_ref().and_then(|p| p.start_marker),
-        snapshot
-            .map(|p| p.fingerprint)
-            .unwrap_or_default(),
+        snapshot.map(|p| p.fingerprint).unwrap_or_default(),
         attempt.run_token.clone(),
     );
     if let Err(e) = tree.attach(&child) {
@@ -519,11 +517,7 @@ fn spawn_stdin_writer(
 }
 
 /// Waits for the tree to disappear, terminating it when the policy says so.
-async fn settle_tree(
-    tree: &TreeGuard,
-    policy: TreePolicy,
-    sink: &mut LogSink,
-) -> TreeOutcome {
+async fn settle_tree(tree: &TreeGuard, policy: TreePolicy, sink: &mut LogSink) -> TreeOutcome {
     if tree.pid() == 0 {
         return TreeOutcome::Unverified;
     }

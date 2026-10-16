@@ -277,7 +277,12 @@ async fn p01_identity_of_a_finished_process_stops_matching() {
     let mut control = spawn_control_process();
     let pid = control.id();
     let snapshot = platform::process_snapshot(pid).expect("control process is inspectable");
-    let identity = ProcessIdentity::new(pid, snapshot.start_marker, snapshot.fingerprint.clone(), "token-a");
+    let identity = ProcessIdentity::new(
+        pid,
+        snapshot.start_marker,
+        snapshot.fingerprint.clone(),
+        "token-a",
+    );
     assert!(identity.matches_os(), "alive and matching");
 
     let _ = control.kill();
@@ -359,10 +364,7 @@ async fn p05_descendant_surviving_the_parent_is_terminated_before_settling() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p05_report_policy_leaves_the_descendant_alive_but_not_owned() {
-    let result = run(
-        spawns_descendant_then_exits().with_tree_policy(TreePolicy::ReportOnly),
-    )
-    .await;
+    let result = run(spawns_descendant_then_exits().with_tree_policy(TreePolicy::ReportOnly)).await;
     let pids = match &result.outcome.tree {
         TreeOutcome::Survived { pids, .. } => pids.clone(),
         other => panic!("report policy must report a surviving tree, got {other:?}"),
@@ -386,11 +388,9 @@ async fn p05_report_policy_leaves_the_descendant_alive_but_not_owned() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p07_timeout_is_enforced_while_stdin_is_blocked() {
     let started = std::time::Instant::now();
-    let result = run(
-        sleeper()
-            .with_prompt(LARGE_PROMPT_BYTES)
-            .with_timeout(Duration::from_secs(1)),
-    )
+    let result = run(sleeper()
+        .with_prompt(LARGE_PROMPT_BYTES)
+        .with_timeout(Duration::from_secs(1)))
     .await;
     let elapsed = started.elapsed();
 
@@ -415,12 +415,10 @@ async fn p07_timeout_is_enforced_while_stdin_is_blocked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p06_cancel_is_enforced_while_stdin_is_blocked() {
     let started = std::time::Instant::now();
-    let result = run(
-        sleeper()
-            .with_prompt(LARGE_PROMPT_BYTES)
-            .with_timeout(Duration::from_secs(300))
-            .with_cancel_after(Duration::from_millis(800)),
-    )
+    let result = run(sleeper()
+        .with_prompt(LARGE_PROMPT_BYTES)
+        .with_timeout(Duration::from_secs(300))
+        .with_cancel_after(Duration::from_millis(800)))
     .await;
     let elapsed = started.elapsed();
 
@@ -435,10 +433,7 @@ async fn p06_cancel_is_enforced_while_stdin_is_blocked() {
     );
     assert!(result.outcome.tree.is_closed(), "{:?}", result.outcome.tree);
     if let Some(identity) = &result.outcome.identity {
-        assert!(
-            !identity.matches_os(),
-            "the cancelled process must be gone"
-        );
+        assert!(!identity.matches_os(), "the cancelled process must be gone");
     }
 }
 
@@ -450,10 +445,7 @@ async fn p06_process_flooding_stdout_before_stdin_cannot_deadlock() {
     #[cfg(windows)]
     let req = RunRequest::new(
         "cmd.exe",
-        &[
-            "/C",
-            "for /L %i in (1,1,20000) do @echo flooding-line-%i",
-        ],
+        &["/C", "for /L %i in (1,1,20000) do @echo flooding-line-%i"],
     );
     #[cfg(unix)]
     let req = RunRequest::new("sh", &["-c", "seq 1 20000"]);

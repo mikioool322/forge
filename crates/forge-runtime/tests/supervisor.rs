@@ -11,7 +11,9 @@ use std::time::Duration;
 use forge_core::{AgentKind, AgentSpec};
 use forge_runtime::adapter::AgentJob;
 use forge_runtime::generic::GenericAdapter;
-use forge_runtime::supervisor::{spawn_run, AttemptId, RunEvent, RunOutcome, RunParams, TreePolicy};
+use forge_runtime::supervisor::{
+    spawn_run, AttemptId, RunEvent, RunOutcome, RunParams, TreePolicy,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 
 fn agent_spec(command: &str, args: &[&str], stdin_prompt: bool) -> AgentSpec {

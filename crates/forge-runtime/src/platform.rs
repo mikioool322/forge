@@ -253,7 +253,8 @@ fn windows_process_snapshot(pid: u32) -> Option<OsProcess> {
         // somebody holds a handle to it. Only a process that is still running may
         // be treated as "alive" or as "the process we own".
         let mut exit_code: u32 = 0;
-        let running = GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE as u32;
+        let running =
+            GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE as u32;
         if !running {
             CloseHandle(handle);
             return None;
@@ -315,8 +316,10 @@ fn windows_parent_pid(pid: u32) -> Option<u32> {
         if snapshot == INVALID_HANDLE_VALUE {
             return None;
         }
-        let mut entry = PROCESSENTRY32W::default();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut parent = None;
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
@@ -412,8 +415,9 @@ impl TreeGuard {
         {
             use std::sync::atomic::{AtomicBool, AtomicU32};
             use windows_sys::Win32::System::JobObjects::{
-                CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             };
             // SAFETY: the job is created with default security attributes and no
             // name; the handle is owned by this guard and closed in Drop.
@@ -429,7 +433,12 @@ impl TreeGuard {
                 };
             }
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // KILL_ON_JOB_CLOSE: a daemon that dies takes its whole tree with it.
+            // BREAKAWAY_OK: a tool that *deliberately* detaches a helper (and asks
+            // for breakaway) is allowed to leave the tree; such a process is then
+            // outside Forge's ownership and is reported, never silently claimed.
+            info.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             // SAFETY: `info` is a fully initialized struct of the documented size.
             let ok = unsafe {
                 SetInformationJobObject(
@@ -446,13 +455,13 @@ impl TreeGuard {
                     "cannot set KILL_ON_JOB_CLOSE; the tree is terminated per run only"
                 );
             }
-            return Self {
+            Self {
                 inner: TreeInner {
                     job,
                     pid: AtomicU32::new(0),
                     kill_on_close: AtomicBool::new(kill_on_close),
                 },
-            };
+            }
         }
         #[cfg(unix)]
         {
@@ -501,7 +510,7 @@ impl TreeGuard {
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::JobObjects::{
-                QueryInformationJobObject, JobObjectBasicProcessIdList,
+                JobObjectBasicProcessIdList, QueryInformationJobObject,
                 JOBOBJECT_BASIC_PROCESS_ID_LIST,
             };
             if self.inner.job.is_null() {
@@ -583,7 +592,11 @@ impl TreeGuard {
         }
         #[cfg(unix)]
         {
-            let sig = if graceful { libc::SIGTERM } else { libc::SIGKILL };
+            let sig = if graceful {
+                libc::SIGTERM
+            } else {
+                libc::SIGKILL
+            };
             // SAFETY: negative pid targets the whole process group.
             unsafe {
                 libc::kill(-(pid as i32), sig);
@@ -599,7 +612,7 @@ impl TreeGuard {
         {
             use std::sync::atomic::Ordering;
             use windows_sys::Win32::System::JobObjects::{
-                SetInformationJobObject, JobObjectExtendedLimitInformation,
+                JobObjectExtendedLimitInformation, SetInformationJobObject,
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             };
             if self.inner.job.is_null() {
@@ -629,7 +642,7 @@ impl TreeGuard {
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::JobObjects::{
-                QueryInformationJobObject, JobObjectBasicProcessIdList,
+                JobObjectBasicProcessIdList, QueryInformationJobObject,
                 JOBOBJECT_BASIC_PROCESS_ID_LIST,
             };
             if self.inner.job.is_null() {

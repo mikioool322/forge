@@ -189,4 +189,16 @@ pub struct DemoAgentArgs {
     /// generic adapters can append the prompt as a positional argument).
     #[arg(hide = true)]
     pub prompt: Option<String>,
+    /// Read up to N bytes from stdin before doing anything else
+    /// (0 = never read stdin). Used by the stdin-backpressure tests.
+    #[arg(long, default_value_t = 0)]
+    pub read_stdin_bytes: usize,
+    /// Spawn a helper process that outlives this one, for the given number of
+    /// milliseconds (tree-ownership tests).
+    #[arg(long, default_value_t = 0)]
+    pub spawn_descendant_ms: u64,
+    /// Spawn that helper with `CREATE_BREAKAWAY_FROM_JOB`, so it leaves Forge's
+    /// process tree deliberately.
+    #[arg(long)]
+    pub breakaway: bool,
 }
