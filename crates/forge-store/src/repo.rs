@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use forge_core::model::{
     now_ms, AgentKind, AgentSession, EventKind, EventRecord, Project, ResourceLease, SessionState,
-    Severity, Task, TaskArtifact, TaskId, TaskState, Worktree, WorktreeState,
+    SessionTreeState, Severity, Task, TaskArtifact, TaskId, TaskState, Worktree, WorktreeState,
 };
 use forge_core::AgentSpec;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -761,6 +761,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRow>, StoreError> {
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSession, StoreError> {
     let state_raw: String = row.get("state")?;
+    let tree_raw: Option<String> = row.get("tree_state")?;
     Ok(AgentSession {
         id: row.get("id")?,
         agent_id: row.get("agent_id")?,
@@ -771,33 +772,76 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSession, StoreError>
         ended_at: row.get("ended_at")?,
         exit_code: row.get("exit_code")?,
         worktree_id: row.get("worktree_id")?,
+        attempt_no: row.get("attempt_no")?,
+        run_token: row.get("run_token")?,
+        pid_start_marker: row.get("pid_start_marker")?,
+        pid_fingerprint: row.get("pid_fingerprint")?,
+        owner_instance: row.get("owner_instance")?,
+        tree_state: tree_raw.as_deref().and_then(SessionTreeState::parse),
     })
 }
 
-pub fn open_session(
-    conn: &Connection,
-    agent_id: &str,
-    task_id: TaskId,
-    worktree_id: Option<i64>,
-) -> Result<i64, StoreError> {
+/// Everything a new attempt must be created with (Sprint 01.5A).
+///
+/// The row is written **before** the agent process is spawned, so a process can
+/// never run without a durable owner.
+#[derive(Debug, Clone)]
+pub struct NewSession<'a> {
+    pub agent_id: &'a str,
+    pub task_id: TaskId,
+    pub worktree_id: Option<i64>,
+    /// Daemon instance that will own the attempt.
+    pub owner_instance: &'a str,
+    /// Attempt number within the task (`tasks.attempts`).
+    pub attempt_no: i64,
+    /// Per-attempt token; part of the durable identity.
+    pub run_token: &'a str,
+}
+
+/// Process identity as recorded with the attempt (findings A01/A02).
+#[derive(Debug, Clone)]
+pub struct SessionProcessIdentity {
+    pub pid: u32,
+    pub start_marker: Option<i64>,
+    pub fingerprint: String,
+}
+
+pub fn open_session(conn: &Connection, session: &NewSession<'_>) -> Result<i64, StoreError> {
     conn.execute(
-        "INSERT INTO agent_sessions (agent_id, task_id, worktree_id, state, started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO agent_sessions (
+             agent_id, task_id, worktree_id, state, started_at,
+             owner_instance, attempt_no, run_token
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
-            agent_id,
-            task_id,
-            worktree_id,
+            session.agent_id,
+            session.task_id,
+            session.worktree_id,
             SessionState::Starting.as_str(),
-            now_ms()
+            now_ms(),
+            session.owner_instance,
+            session.attempt_no,
+            session.run_token,
         ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-pub fn set_session_running(conn: &Connection, session_id: i64, pid: u32) -> Result<(), StoreError> {
+pub fn set_session_running(
+    conn: &Connection,
+    session_id: i64,
+    identity: &SessionProcessIdentity,
+) -> Result<(), StoreError> {
     conn.execute(
-        "UPDATE agent_sessions SET state = ?1, pid = ?2 WHERE id = ?3",
-        params![SessionState::Running.as_str(), pid as i64, session_id],
+        "UPDATE agent_sessions
+            SET state = ?1, pid = ?2, pid_start_marker = ?3, pid_fingerprint = ?4
+          WHERE id = ?5",
+        params![
+            SessionState::Running.as_str(),
+            identity.pid as i64,
+            identity.start_marker,
+            identity.fingerprint,
+            session_id,
+        ],
     )?;
     Ok(())
 }
@@ -807,10 +851,19 @@ pub fn close_session(
     session_id: i64,
     state: SessionState,
     exit_code: Option<i32>,
+    tree_state: Option<SessionTreeState>,
 ) -> Result<(), StoreError> {
     conn.execute(
-        "UPDATE agent_sessions SET state = ?1, ended_at = ?2, exit_code = ?3 WHERE id = ?4",
-        params![state.as_str(), now_ms(), exit_code, session_id],
+        "UPDATE agent_sessions
+            SET state = ?1, ended_at = ?2, exit_code = ?3, tree_state = ?4
+          WHERE id = ?5",
+        params![
+            state.as_str(),
+            now_ms(),
+            exit_code,
+            tree_state.map(|t| t.as_str()),
+            session_id,
+        ],
     )?;
     Ok(())
 }

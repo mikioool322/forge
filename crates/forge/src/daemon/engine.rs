@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use forge_core::model::{
     normalize_claim, now_ms, AgentInfo, AgentState, EventKind, NormalizedEvent, PlanFile,
-    ProbeStatus, Project, SessionState, Severity, Task, TaskId, TaskState, WorktreeState,
+    ProbeStatus, Project, SessionState, SessionTreeState, Severity, Task, TaskId, TaskState,
+    WorktreeState,
 };
 use forge_core::scheduler::{
     self, AgentScheduleView, ScheduledAction, SchedulerInput, SchedulerTask,
@@ -25,12 +26,14 @@ use forge_core::scheduler::{
 use forge_core::{ForgeConfig, ForgePaths};
 use forge_git::GitRepo;
 use forge_protocol::messages::{
-    DaemonInfo, ErrorCode, Notification, Response, StateSnapshot, TaskDetail, TaskView,
+    AttemptView, DaemonInfo, ErrorCode, Notification, Response, StateSnapshot, TaskDetail, TaskView,
     PROTOCOL_VERSION,
 };
 use forge_runtime::adapter::{adapter_for, AgentJob, HelpFlags};
-use forge_runtime::platform;
-use forge_runtime::supervisor::{spawn_run, RunEvent, RunHandle, RunOutcome, RunParams};
+use forge_runtime::platform::{self, ProcessIdentity};
+use forge_runtime::supervisor::{
+    spawn_run, AttemptId, RunEvent, RunHandle, RunOutcome, RunParams, TreeOutcome, TreePolicy,
+};
 use forge_store::repo::{self, NewEvent, PlanInsertTask};
 use forge_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -137,15 +140,26 @@ pub fn spawn_engine(startup: EngineStartup) -> EngineHandles {
 // ---------------------------------------------------------------------------
 
 /// A supervised run plus bookkeeping for the "lost outcome" safety net.
+///
+/// The entry is the **execution occupancy** of a task: it exists from the
+/// moment the attempt is dispatched until its outcome has been applied and the
+/// process tree is confirmed closed. It is deliberately independent of
+/// `TaskState`, so cancelling a task cannot release its slot early (A05).
 struct RunEntry {
     handle: RunHandle,
+    /// Attempt identity; every arriving event/outcome must match it (A05/P09).
+    attempt: AttemptId,
+    /// True once a cancel was requested for this attempt.
+    cancelling: bool,
     join_finished_at: Option<Instant>,
 }
 
 impl RunEntry {
     fn new(handle: RunHandle) -> Self {
         Self {
+            attempt: handle.attempt.clone(),
             handle,
+            cancelling: false,
             join_finished_at: None,
         }
     }
@@ -394,33 +408,94 @@ impl Engine {
                 let sid = s.id;
                 let _ = self
                     .store
-                    .call(move |conn| repo::close_session(conn, sid, SessionState::Crashed, None))
+                    .call(move |conn| {
+                        repo::close_session(
+                            conn,
+                            sid,
+                            SessionState::Crashed,
+                            None,
+                            Some(SessionTreeState::Unverified),
+                        )
+                    })
                     .await;
             }
         }
 
         for task in active {
             let mut note = String::new();
-            // 1. orphan process?
+            // 1. orphan process? Ownership must be *proven* (finding A01):
+            //    a PID alone is never evidence, and an unprovable process is
+            //    left alone and reported as unresolved.
+            let tree_verdict;
             if let Some(session) = open_sessions.iter().rev().find(|s| s.task_id == task.id) {
                 if let Some(pid) = session.pid {
-                    if platform::process_alive(pid) {
+                    let identity = ProcessIdentity::new(
+                        pid,
+                        session.pid_start_marker.map(|m| m as u64),
+                        session.pid_fingerprint.clone().unwrap_or_default(),
+                        session.run_token.clone().unwrap_or_default(),
+                    );
+                    if platform::process_snapshot(pid).is_none() {
+                        tree_verdict = SessionTreeState::Empty;
+                        note = format!("attempt process {pid} is already gone");
+                    } else if identity.matches_os() {
                         match self.cfg.recovery.orphan_action {
                             forge_core::config::OrphanAction::Kill => {
+                                // Ownership is proven, so terminating the tree is safe.
                                 let _ = platform::kill_tree(pid, true);
-                                note = format!("orphan process {pid} killed");
+                                tree_verdict = SessionTreeState::Terminated;
+                                note = format!("orphan process {pid} verified and killed");
                             }
                             forge_core::config::OrphanAction::Report => {
-                                note = format!("orphan process {pid} left running (recovery.orphan_action=report)");
+                                tree_verdict = SessionTreeState::Survived;
+                                note = format!(
+                                    "orphan process {pid} verified and left running (recovery.orphan_action=report)"
+                                );
                             }
                         }
+                    } else {
+                        // Not provably ours: never kill. Report and move on.
+                        tree_verdict = SessionTreeState::Survived;
+                        note = format!(
+                            "process {pid} could not be proven to belong to this attempt (identity mismatch); left running - UNRESOLVED"
+                        );
+                        self.record(NewEvent {
+                            project_id: Some(task.project_id),
+                            task_id: Some(task.id),
+                            agent_id: task.agent_id.clone(),
+                            kind: EventKind::Recovery,
+                            severity: Severity::Error,
+                            message: format!(
+                                "{}: unproven process {pid} was NOT terminated; operator decision required",
+                                task.display_id()
+                            ),
+                            data: None,
+                        });
                     }
+                } else {
+                    // The attempt never recorded a PID: on Windows the Job Object
+                    // closed with the daemon and killed the tree; on Unix the
+                    // process (if any) cannot be located, so nothing is claimed.
+                    tree_verdict = SessionTreeState::Unverified;
+                    note = "attempt had no recorded process identity".to_string();
                 }
                 let sid = session.id;
                 let _ = self
                     .store
-                    .call(move |conn| repo::close_session(conn, sid, SessionState::Crashed, None))
+                    .call(move |conn| {
+                        repo::close_session(
+                            conn,
+                            sid,
+                            SessionState::Crashed,
+                            None,
+                            Some(tree_verdict),
+                        )
+                    })
                     .await;
+            } else {
+                // An active task without an open attempt row: nothing to settle.
+                tree_verdict = SessionTreeState::Unverified;
+                let _ = tree_verdict;
             }
             // 2. release leases
             let tid = task.id;
@@ -601,14 +676,54 @@ impl Engine {
         TaskView {
             task: task.clone(),
             deps: self.deps.get(&task.id).cloned().unwrap_or_default(),
+            attempt: self.attempt_view(task.id),
         }
     }
 
+    /// The live attempt of a task, if one is occupying a slot (Sprint 01.5A).
+    fn attempt_view(&self, task_id: TaskId) -> Option<AttemptView> {
+        let entry = self.runs.get(&task_id)?;
+        let pid = entry.handle.pid.load(std::sync::atomic::Ordering::SeqCst);
+        let state = if entry.cancelling {
+            "CANCELLING"
+        } else if pid == 0 {
+            "STARTING"
+        } else {
+            "RUNNING"
+        };
+        Some(AttemptView {
+            attempt_no: entry.attempt.attempt_no,
+            pid,
+            state: state.to_string(),
+            tree_state: None,
+        })
+    }
+
+    /// Slots actually occupied right now: live attempts plus tasks in the
+    /// pre-spawn window (LEASED). Task states alone are not occupancy (A05).
+    fn occupied_slots(&self) -> usize {
+        self.runs.len()
+            + self
+                .tasks
+                .values()
+                .filter(|t| t.state == TaskState::Leased)
+                .count()
+    }
+
     fn running_for_agent(&self, agent_id: &str) -> u32 {
-        self.tasks
+        let running = self
+            .runs
+            .keys()
+            .filter(|task_id| {
+                self.tasks.get(*task_id).and_then(|t| t.agent_id.as_deref()) == Some(agent_id)
+            })
+            .count();
+        let leased = self
+            .tasks
             .values()
-            .filter(|t| t.agent_id.as_deref() == Some(agent_id) && t.state == TaskState::Running)
-            .count() as u32
+            .filter(|t| t.state == TaskState::Leased && t.agent_id.as_deref() == Some(agent_id))
+            .count();
+        (running + leased) as u32
     }
 
     fn agent_infos(&self) -> Vec<AgentInfo> {
@@ -971,7 +1086,10 @@ impl Engine {
         }
         if task.state.is_active() {
             self.pending_cancel.insert(task.id);
-            if let Some(entry) = self.runs.get(&task.id) {
+            if let Some(entry) = self.runs.get_mut(&task.id) {
+                // Cancelling is an *intent*: the attempt keeps occupying its slot
+                // until the process tree is confirmed closed (finding A05).
+                entry.cancelling = true;
                 let _ = entry.handle.kill.send(true);
             }
         }
@@ -983,7 +1101,14 @@ impl Engine {
                 agent_id: task.agent_id.clone(),
                 kind: EventKind::TaskStateChanged,
                 severity: Severity::Warn,
-                message: format!("{display} cancelled: {reason}"),
+                message: format!(
+                    "{display} cancelled: {reason}{}",
+                    if self.runs.contains_key(&task.id) {
+                        " (process tree termination in progress; the execution slot stays occupied until it is confirmed closed)"
+                    } else {
+                        ""
+                    }
+                ),
                 data: None,
             });
             Response::Ack {
@@ -1008,6 +1133,19 @@ impl Engine {
                     "{} is {}; only FAILED or INTERRUPTED tasks can be retried",
                     task.display_id(),
                     task.state
+                )),
+            };
+        }
+        if self.runs.contains_key(&task.id) {
+            // Attempt isolation: a new attempt must not start on top of an
+            // unsettled one (findings A05/P09).
+            return Response::Ack {
+                note: Some(format!(
+                    "{} still has a live attempt ({}); wait for its process tree to close before retrying",
+                    task.display_id(),
+                    self.attempt_view(task.id)
+                        .map(|a| format!("attempt {} pid {}", a.attempt_no, a.pid))
+                        .unwrap_or_else(|| "unsettled".into())
                 )),
             };
         }
@@ -1244,7 +1382,10 @@ impl Engine {
             .iter()
             .map(|(resource, task_id)| (*task_id, resource.clone()))
             .collect();
-        let running_count = self.tasks.values().filter(|t| t.state.is_active()).count();
+        // Occupancy is measured in *attempts*, not task states: a cancelled task
+        // whose process tree is not confirmed closed still occupies its slot
+        // (finding A05).
+        let running_count = self.occupied_slots();
         SchedulerInput {
             tasks,
             agents,
@@ -1338,6 +1479,19 @@ impl Engine {
         }
         let agent_spec = agent.spec.clone();
         let help = agent.help.clone();
+        // Hard gates: never exceed the configured limits, even when a scheduling
+        // batch was computed from a stale snapshot (finding A05).
+        if self.occupied_slots() >= self.cfg.daemon.max_concurrency as usize {
+            return;
+        }
+        if self.running_for_agent(&agent_id) >= agent_spec.slots {
+            return;
+        }
+        if self.runs.contains_key(&task_id) {
+            // An unsettled attempt of this task still exists: a new one must not
+            // start on top of it (attempt isolation, finding A05/P09).
+            return;
+        }
         let Some(project) = self
             .projects
             .values()
@@ -1546,14 +1700,50 @@ impl Engine {
                 .await;
             return;
         }
-        let session_id = self
+        // Durable attempt identity (finding A02).
+        //
+        // The attempt row is committed *before* the process exists, and the
+        // agent only starts real work when its prompt is written — which happens
+        // after this commit. A failed write therefore means "no process", never
+        // "a process without an owner".
+        let attempt_no = task.attempts.max(0);
+        let run_token = new_run_token(task_id, attempt_no);
+        let attempt = AttemptId::new(task_id, attempt_no, run_token.clone());
+        let owner_instance = self.instance_id.clone();
+        let session_id = match self
             .store
             .call({
                 let agent_id = agent_id.clone();
-                move |conn| repo::open_session(conn, &agent_id, task_id, Some(worktree_row.id))
+                let owner_instance = owner_instance.clone();
+                let run_token = run_token.clone();
+                move |conn| {
+                    repo::open_session(
+                        conn,
+                        &repo::NewSession {
+                            agent_id: &agent_id,
+                            task_id,
+                            worktree_id: Some(worktree_row.id),
+                            owner_instance: &owner_instance,
+                            attempt_no,
+                            run_token: &run_token,
+                        },
+                    )
+                }
             })
             .await
-            .unwrap_or(0);
+        {
+            Ok(id) => id,
+            Err(e) => {
+                // No durable owner means no process may run (fail closed).
+                self.fail_task(
+                    task_id,
+                    &format!("cannot record the attempt before start: {e}"),
+                    Some(agent_id),
+                )
+                .await;
+                return;
+            }
+        };
         self.sessions.insert(task_id, session_id);
         let _ = self
             .store
@@ -1612,6 +1802,11 @@ impl Engine {
             max_log_bytes: self.cfg.logs.max_file_bytes,
             max_line_bytes: self.cfg.logs.max_line_bytes,
             heartbeat_interval: Duration::from_secs(self.cfg.daemon.heartbeat_interval_secs.max(1)),
+            attempt: attempt.clone(),
+            tree_policy: match self.cfg.recovery.orphan_action {
+                forge_core::config::OrphanAction::Kill => TreePolicy::KillOnExit,
+                forge_core::config::OrphanAction::Report => TreePolicy::ReportOnly,
+            },
         };
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let (ev_tx, mut ev_rx) = mpsc::channel::<RunEvent>(1024);
@@ -1634,6 +1829,23 @@ impl Engine {
                 });
             }
             Err(e) => {
+                // The attempt row exists but no process does: settle it as
+                // crashed so recovery never sees an open attempt without a
+                // process, and fail the task.
+                let sid = session_id;
+                let _ = self
+                    .store
+                    .call(move |conn| {
+                        repo::close_session(
+                            conn,
+                            sid,
+                            SessionState::Crashed,
+                            None,
+                            Some(SessionTreeState::Empty),
+                        )
+                    })
+                    .await;
+                self.sessions.remove(&task_id);
                 self.fail_task(
                     task_id,
                     &format!("failed to start agent process: {e}"),
@@ -1700,12 +1912,24 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     async fn handle_run_event(&mut self, task_id: TaskId, event: RunEvent) {
+        // Attempt isolation: events are only applied while the attempt that
+        // produced them still owns the task. A late event from a settled attempt
+        // (in flight in the channel) is dropped, never applied to a newer one.
+        if !self.runs.contains_key(&task_id) {
+            tracing::debug!(task = task_id, "dropping an event with no live attempt");
+            return;
+        }
         match event {
-            RunEvent::Started { pid } => {
+            RunEvent::Started { pid, identity } => {
                 if let Some(session_id) = self.sessions.get(&task_id).copied() {
+                    let recorded = repo::SessionProcessIdentity {
+                        pid,
+                        start_marker: identity.start_marker.map(|m| m as i64),
+                        fingerprint: identity.fingerprint.clone(),
+                    };
                     let _ = self
                         .store
-                        .call(move |conn| repo::set_session_running(conn, session_id, pid))
+                        .call(move |conn| repo::set_session_running(conn, session_id, &recorded))
                         .await;
                 }
                 let task = self.tasks.get(&task_id);
@@ -1716,8 +1940,13 @@ impl Engine {
                     kind: EventKind::ProcessStarted,
                     severity: Severity::Info,
                     message: format!(
-                        "{} agent process started (pid {pid})",
-                        task.map(|t| t.display_id()).unwrap_or_default()
+                        "{} agent process started (pid {pid}, identity {})",
+                        task.map(|t| t.display_id()).unwrap_or_default(),
+                        if identity.matches_os() {
+                            "verified"
+                        } else {
+                            "recorded"
+                        }
                     ),
                     data: None,
                 });
@@ -1763,6 +1992,24 @@ impl Engine {
     }
 
     async fn handle_run_outcome(&mut self, task_id: TaskId, outcome: RunOutcome) {
+        // Attempt isolation (findings A05/P09): an outcome of a superseded or
+        // already-settled attempt must never modify the current state.
+        match self.runs.get(&task_id) {
+            Some(entry) if entry.attempt == outcome.attempt => {}
+            Some(entry) => {
+                tracing::warn!(
+                    task = task_id,
+                    stale = %outcome.attempt.display(),
+                    current = %entry.attempt.display(),
+                    "ignoring an outcome of a stale attempt"
+                );
+                return;
+            }
+            None => {
+                tracing::debug!(task = task_id, "ignoring an outcome with no live attempt");
+                return;
+            }
+        }
         self.runs.remove(&task_id);
         let was_cancelled = self.pending_cancel.remove(&task_id);
         let Some(task) = self.tasks.get(&task_id).cloned() else {
@@ -1786,9 +2033,12 @@ impl Engine {
                 }
             };
             let exit_code = outcome.exit_code;
+            let tree_state = session_tree_state(&outcome.tree);
             let _ = self
                 .store
-                .call(move |conn| repo::close_session(conn, session_id, session_state, exit_code))
+                .call(move |conn| {
+                    repo::close_session(conn, session_id, session_state, exit_code, Some(tree_state))
+                })
                 .await;
         }
 
@@ -1962,6 +2212,43 @@ impl Engine {
 
         match outcome.classification {
             forge_runtime::ExitClass::Success => {
+                // Tree contract (finding A03): with the kill policy, a run whose
+                // descendants survived is NOT a clean completion. With the report
+                // policy the operator asked for the descendants to be left alone,
+                // so the run completes with a loud warning instead.
+                if !outcome.tree.is_closed() {
+                    let kill_policy = matches!(
+                        self.cfg.recovery.orphan_action,
+                        forge_core::config::OrphanAction::Kill
+                    );
+                    if kill_policy {
+                        self.fail_task(
+                            task_id,
+                            &format!(
+                                "descendant processes survived the run (tree: {:?}); the worktree is retained for inspection",
+                                outcome.tree
+                            ),
+                            agent_id.clone(),
+                        )
+                        .await;
+                        self.broadcast_task(task_id);
+                        self.flush_events().await;
+                        return;
+                    }
+                    self.record(NewEvent {
+                        project_id: Some(task.project_id),
+                        task_id: Some(task_id),
+                        agent_id: agent_id.clone(),
+                        kind: EventKind::ProcessExited,
+                        severity: Severity::Warn,
+                        message: format!(
+                            "{} completed, but descendant processes were left running (recovery.orphan_action=report, tree: {:?})",
+                            task.display_id(),
+                            outcome.tree
+                        ),
+                        data: None,
+                    });
+                }
                 self.transition(task_id, TaskState::ReviewPending).await;
                 let _ = self
                     .store
@@ -2140,7 +2427,7 @@ impl Engine {
         // deadline; this catches pathological cases such as a panicked
         // supervisor task).
         let now = now_ms();
-        let mut to_kill: Vec<(TaskId, u32)> = vec![];
+        let mut to_kill: Vec<(TaskId, String, Arc<forge_runtime::platform::TreeGuard>)> = vec![];
         let mut lost: Vec<TaskId> = vec![];
         for (task_id, entry) in &self.runs {
             if let Some(task) = self.tasks.get(task_id) {
@@ -2152,8 +2439,12 @@ impl Engine {
                     * 1000;
                 if let Some(started) = task.started_at {
                     if now - started > timeout_ms {
-                        let pid = entry.handle.pid.load(std::sync::atomic::Ordering::SeqCst);
-                        to_kill.push((*task_id, pid));
+                        // Ownership is the handle we hold, never a PID (A01).
+                        to_kill.push((
+                            *task_id,
+                            entry.attempt.display(),
+                            entry.handle.tree.clone(),
+                        ));
                     }
                 }
             }
@@ -2168,11 +2459,13 @@ impl Engine {
                 }
             }
         }
-        for (task_id, pid) in to_kill {
-            tracing::warn!(task = task_id, pid, "safety-net timeout: killing process");
-            if pid != 0 {
-                let _ = platform::kill_tree(pid, true);
-            }
+        for (task_id, attempt, tree) in to_kill {
+            tracing::warn!(
+                task = task_id,
+                attempt = %attempt,
+                "safety-net timeout: terminating the owned process tree"
+            );
+            let _ = tree.terminate(false);
         }
         for task_id in lost {
             if self.runs.remove(&task_id).is_some() {
@@ -2190,7 +2483,11 @@ impl Engine {
 
     async fn shutdown(&mut self) {
         let mut remaining: HashSet<TaskId> = self.runs.keys().copied().collect();
-        for (_, entry) in self.runs.drain() {
+        // Ownership handles of the attempts we are about to stop: a PID is never
+        // used to terminate anything (finding A01).
+        let mut guards: Vec<(TaskId, Arc<forge_runtime::platform::TreeGuard>)> = vec![];
+        for (task_id, entry) in self.runs.drain() {
+            guards.push((task_id, entry.handle.tree.clone()));
             let _ = entry.handle.kill.send(true);
         }
         // Give supervisors a moment to report outcomes.
@@ -2214,18 +2511,10 @@ impl Engine {
         for task_id in orphan_ids {
             let task = self.tasks.get(&task_id).cloned();
             if let Some(task) = task {
-                if let Some(pid) = self
-                    .store
-                    .call(move |conn| {
-                        Ok(repo::sessions_for_task(conn, task_id)?
-                            .into_iter()
-                            .rev()
-                            .find_map(|s| s.pid))
-                    })
-                    .await
-                    .unwrap_or(None)
-                {
-                    let _ = platform::kill_tree(pid, true);
+                // Terminate through the handle we own; the durable PID is only
+                // diagnostic here (finding A01).
+                if let Some((_, guard)) = guards.iter().find(|(id, _)| *id == task_id) {
+                    let _ = guard.terminate(false);
                 }
                 let reason = "daemon shutdown while the task was running";
                 let _ = self
@@ -2276,7 +2565,15 @@ impl Engine {
                 let sid = s.id;
                 let _ = self
                     .store
-                    .call(move |conn| repo::close_session(conn, sid, SessionState::Killed, None))
+                    .call(move |conn| {
+                        repo::close_session(
+                            conn,
+                            sid,
+                            SessionState::Killed,
+                            None,
+                            Some(SessionTreeState::Unverified),
+                        )
+                    })
                     .await;
             }
         }
@@ -2303,6 +2600,25 @@ impl Engine {
         });
         self.flush_events().await;
         tracing::info!("engine stopped");
+    }
+}
+
+/// Per-attempt token (Sprint 01.5A): identifies one attempt in the durable
+/// record. It is an identity marker, not a secret.
+fn new_run_token(task_id: TaskId, attempt_no: i64) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{task_id}-a{attempt_no}-{}-{n}", now_ms())
+}
+
+/// Durable verdict of a settled process tree (finding A03).
+fn session_tree_state(tree: &TreeOutcome) -> SessionTreeState {
+    match tree {
+        TreeOutcome::Empty => SessionTreeState::Empty,
+        TreeOutcome::Terminated { .. } => SessionTreeState::Terminated,
+        TreeOutcome::Survived { .. } => SessionTreeState::Survived,
+        TreeOutcome::Unverified => SessionTreeState::Unverified,
     }
 }
 

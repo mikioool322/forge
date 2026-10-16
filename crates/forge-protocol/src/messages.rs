@@ -192,6 +192,26 @@ pub enum Frame {
 pub struct TaskView {
     pub task: Task,
     pub deps: Vec<TaskId>,
+    /// Live execution attempt, when one is occupying a slot (Sprint 01.5A).
+    #[serde(default)]
+    pub attempt: Option<AttemptView>,
+}
+
+/// The resource-occupying unit of a task (Sprint 01.5A).
+///
+/// Deliberately independent of `Task.state`: a cancelled task can still occupy
+/// its slot until the process tree is confirmed closed, and a retried task
+/// starts a *new* attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptView {
+    pub attempt_no: i64,
+    pub pid: u32,
+    /// `STARTING` (spawned, identity not yet committed), `RUNNING`, or
+    /// `CANCELLING` (cancel requested, process not yet confirmed gone).
+    pub state: String,
+    /// Durable tree verdict, when the attempt already settled.
+    #[serde(default)]
+    pub tree_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +335,7 @@ mod tests {
             Response::Task(Box::new(TaskView {
                 task: dummy_task(),
                 deps: vec![],
+                attempt: None,
             })),
             Response::TaskDetail(Box::new(TaskDetail {
                 task: dummy_task(),
@@ -370,6 +391,7 @@ mod tests {
             Notification::TaskChanged(Box::new(TaskView {
                 task: dummy_task(),
                 deps: vec![],
+                attempt: None,
             })),
             Notification::AgentsChanged { agents: vec![] },
             Notification::Event(Box::new(EventRecord {

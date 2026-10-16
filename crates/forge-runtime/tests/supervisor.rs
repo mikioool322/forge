@@ -11,7 +11,7 @@ use std::time::Duration;
 use forge_core::{AgentKind, AgentSpec};
 use forge_runtime::adapter::AgentJob;
 use forge_runtime::generic::GenericAdapter;
-use forge_runtime::supervisor::{spawn_run, RunEvent, RunOutcome, RunParams};
+use forge_runtime::supervisor::{spawn_run, AttemptId, RunEvent, RunOutcome, RunParams, TreePolicy};
 use tokio::sync::{mpsc, oneshot, watch};
 
 fn agent_spec(command: &str, args: &[&str], stdin_prompt: bool) -> AgentSpec {
@@ -103,6 +103,8 @@ async fn run(
         max_log_bytes: 1024 * 1024,
         max_line_bytes: 4096,
         heartbeat_interval: Duration::from_millis(200),
+        attempt: AttemptId::new(1, 0, "test-token"),
+        tree_policy: TreePolicy::KillOnExit,
     };
     let (ev_tx, mut ev_rx) = mpsc::channel::<RunEvent>(512);
     let (outcome_tx, outcome_rx) = oneshot::channel::<RunOutcome>();

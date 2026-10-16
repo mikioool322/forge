@@ -10,10 +10,16 @@ use rusqlite::Connection;
 use crate::error::StoreError;
 
 /// `(name, sql)` pairs, ordered by version. Version N = index N-1.
-pub const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_init",
-    include_str!("../../../migrations/0001_init.sql"),
-)];
+pub const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_init",
+        include_str!("../../../migrations/0001_init.sql"),
+    ),
+    (
+        "0002_process_identity",
+        include_str!("../../../migrations/0002_process_identity.sql"),
+    ),
+];
 
 pub fn latest_version() -> i64 {
     MIGRATIONS.len() as i64

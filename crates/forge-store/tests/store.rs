@@ -452,12 +452,34 @@ async fn sessions_track_process_lifecycle() {
     let session_id = store
         .call({
             let tid = task.id;
-            move |conn| repo::open_session(conn, "codex-a", tid, None)
+            move |conn| {
+                repo::open_session(
+                    conn,
+                    &repo::NewSession {
+                        agent_id: "codex-a",
+                        task_id: tid,
+                        worktree_id: None,
+                        owner_instance: "instance-1",
+                        attempt_no: 0,
+                        run_token: "token-1",
+                    },
+                )
+            }
         })
         .await
         .unwrap();
     store
-        .call(move |conn| repo::set_session_running(conn, session_id, 4242))
+        .call(move |conn| {
+            repo::set_session_running(
+                conn,
+                session_id,
+                &repo::SessionProcessIdentity {
+                    pid: 4242,
+                    start_marker: Some(99),
+                    fingerprint: "image|0".into(),
+                },
+            )
+        })
         .await
         .unwrap();
 
@@ -465,13 +487,35 @@ async fn sessions_track_process_lifecycle() {
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].pid, Some(4242));
     assert_eq!(open[0].state, SessionState::Running);
+    assert_eq!(open[0].attempt_no, Some(0));
+    assert_eq!(open[0].run_token.as_deref(), Some("token-1"));
+    assert_eq!(open[0].owner_instance.as_deref(), Some("instance-1"));
+    assert_eq!(open[0].pid_start_marker, Some(99));
+    assert_eq!(open[0].pid_fingerprint.as_deref(), Some("image|0"));
 
     store
-        .call(move |conn| repo::close_session(conn, session_id, SessionState::Exited, Some(0)))
+        .call(move |conn| {
+            repo::close_session(
+                conn,
+                session_id,
+                SessionState::Exited,
+                Some(0),
+                Some(forge_core::model::SessionTreeState::Empty),
+            )
+        })
         .await
         .unwrap();
     let open = store.call(|conn| repo::open_sessions(conn)).await.unwrap();
     assert!(open.is_empty());
+    let all = store
+        .call(move |conn| repo::sessions_for_task(conn, task.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        all[0].tree_state,
+        Some(forge_core::model::SessionTreeState::Empty),
+        "the tree verdict is durable"
+    );
 }
 
 #[tokio::test]

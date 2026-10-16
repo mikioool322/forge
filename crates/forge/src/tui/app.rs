@@ -633,6 +633,7 @@ impl App {
                     plan_key: None,
                 },
                 deps: vec![],
+                attempt: None,
             }
         }
 

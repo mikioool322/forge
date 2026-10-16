@@ -430,6 +430,66 @@ pub struct AgentSession {
     pub ended_at: Option<i64>,
     pub exit_code: Option<i32>,
     pub worktree_id: Option<WorktreeId>,
+    /// Attempt number within the task; a retry starts a new attempt
+    /// (Sprint 01.5A / findings A02/A05).
+    #[serde(default)]
+    pub attempt_no: Option<i64>,
+    /// Per-attempt token, part of the durable identity.
+    #[serde(default)]
+    pub run_token: Option<String>,
+    /// OS start marker of the process. Identity evidence, never a clock.
+    #[serde(default)]
+    pub pid_start_marker: Option<i64>,
+    /// Image fingerprint of the process (executable + parent on Windows,
+    /// command line on Linux). Identity evidence.
+    #[serde(default)]
+    pub pid_fingerprint: Option<String>,
+    /// Daemon instance that owns the attempt.
+    #[serde(default)]
+    pub owner_instance: Option<String>,
+    /// How the process tree ended; `None` while the attempt is unsettled.
+    #[serde(default)]
+    pub tree_state: Option<SessionTreeState>,
+}
+
+/// How a run's process tree ended (finding A03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionTreeState {
+    /// The OS confirmed that no process of the tree is alive.
+    Empty,
+    /// Descendants outlived the direct child and Forge terminated them.
+    Terminated,
+    /// Descendants were still alive when the attempt settled.
+    Survived,
+    /// The tree could not be inspected: nothing is claimed about it.
+    Unverified,
+}
+
+impl SessionTreeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionTreeState::Empty => "EMPTY",
+            SessionTreeState::Terminated => "TERMINATED",
+            SessionTreeState::Survived => "SURVIVED",
+            SessionTreeState::Unverified => "UNVERIFIED",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "EMPTY" => Some(SessionTreeState::Empty),
+            "TERMINATED" => Some(SessionTreeState::Terminated),
+            "SURVIVED" => Some(SessionTreeState::Survived),
+            "UNVERIFIED" => Some(SessionTreeState::Unverified),
+            _ => None,
+        }
+    }
+
+    /// True when Forge can claim the attempt is fully closed.
+    pub fn is_closed(self) -> bool {
+        matches!(self, SessionTreeState::Empty | SessionTreeState::Terminated)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
